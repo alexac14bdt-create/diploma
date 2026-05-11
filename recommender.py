@@ -1,0 +1,452 @@
+import math
+import re
+from sqlalchemy import select, and_, func, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.models import Place, Accessibility, Chain, User
+
+STREET_ABBREVIATIONS = {
+    "проспект": "пр.",
+    "пр-т":     "пр.",
+    "пр-кт":    "пр.",
+    "пр":       "пр.",
+    "улица":    "ул.",
+    "ул":       "ул.",
+    "переулок": "пер.",
+    "пер":      "пер.",
+    "площадь":  "пл.",
+    "пл":       "пл.",
+    "шоссе":    "ш.",
+    "ш":        "ш.",
+    "бульвар":  "б-р.",
+    "б-р":      "б-р.",
+    "набережная": "наб.",
+    "наб":      "наб.",
+    "линия":    "лин.",
+    "лин":      "лин.",
+    "проезд":   "пр-д.",
+    "пр-д":     "пр-д.",
+    "тупик":    "туп.",
+    "аллея":    "ал.",
+}
+
+ORG_ALIASES = {
+    "сбер":          "сбербанк",
+    "сбербанк":      "сбербанк",
+    "пятак":         "пятёрочка",
+    "пятёрка":       "пятёрочка",
+    "пятерка":       "пятёрочка",
+    "пятерочка":     "пятёрочка",
+    "магнит":        "магнит",
+    "перекрёсток":   "перекрёсток",
+    "перекресток":   "перекрёсток",
+    "вкусвилл":      "вкусвилл",
+    "вкус вилл":     "вкусвилл",
+    "макдак":        "макдоналдс",
+    "маки":          "макдоналдс",
+    "макдоналдс":    "макдоналдс",
+    "бургер кинг":   "бургер кинг",
+    "бк":            "бургер кинг",
+    "кфс":           "kfc",
+    "мфц":           "мфц",
+    "мвд":           "мвд",
+    "невис":         "аптека невис",
+    "аптека невис":  "аптека невис",
+    "кофехауз":      "кофе хауз",
+    "кофе хауз":     "кофе хауз",
+    "галерея":       "галерея",
+    "лента":         "лента",
+    "окей":          "окей",
+    "о'кей":         "окей",
+    "park inn":      "park inn",
+    "паркинн":       "park inn",
+    "мариинская":    "мариинская больница",
+    "озерки":        "озерки",
+    "дикси":         "дикси",
+    "ашан":          "ашан",
+    "метро":         "metro",
+    "metro":         "metro",
+}
+
+ORDINAL_MAP = {
+    "1-й": "первый",   "1-я": "первая",   "1-е": "первое",
+    "2-й": "второй",   "2-я": "вторая",   "2-е": "второе",
+    "3-й": "третий",   "3-я": "третья",   "3-е": "третье",
+    "4-й": "четвёртый","4-я": "четвёртая","4-е": "четвёртое",
+    "5-й": "пятый",    "5-я": "пятая",    "5-е": "пятое",
+    "6-й": "шестой",   "6-я": "шестая",   "6-е": "шестое",
+    "7-й": "седьмой",  "7-я": "седьмая",  "7-е": "седьмое",
+    "8-й": "восьмой",  "8-я": "восьмая",  "8-е": "восьмое",
+    "9-й": "девятый",  "9-я": "девятая",  "9-е": "девятое",
+    "10-й": "десятый", "10-я": "десятая", "10-е": "десятое",
+    "первый": "1-й",   "первая": "1-я",   "первое": "1-е",
+    "второй": "2-й",   "вторая": "2-я",   "второе": "2-е",
+    "третий": "3-й",   "третья": "3-я",   "третье": "3-е",
+    "четвёртый": "4-й","четвёртая": "4-я","четвёртое": "4-е",
+    "пятый": "5-й",    "пятая": "5-я",    "пятое": "5-е",
+    "шестой": "6-й",   "шестая": "6-я",   "шестое": "6-е",
+    "седьмой": "7-й",  "седьмая": "7-я",  "седьмое": "7-е",
+    "восьмой": "8-й",  "восьмая": "8-я",  "восьмое": "8-е",
+    "девятый": "9-й",  "девятая": "9-я",  "девятое": "9-е",
+    "десятый": "10-й", "десятая": "10-я", "десятое": "10-е",
+}
+
+def normalize_yo(text: str) -> str:
+    return text.replace('ё', 'е')
+
+def normalize_name(raw: str) -> str:
+    cleaned = raw.strip().lower()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return ORG_ALIASES.get(cleaned, cleaned)
+
+def normalize_address(raw: str) -> list[str]:
+    text = raw.strip().lower()
+    text = re.sub(r'[,]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    result_tokens = []
+    for token in text.split():
+        token_clean = token.rstrip('.')
+        if token_clean in STREET_ABBREVIATIONS:
+            result_tokens.append(STREET_ABBREVIATIONS[token_clean])
+        else:
+            result_tokens.append(token_clean)
+
+    return result_tokens
+
+def extract_street_name(tokens: list[str]) -> str:
+    street_type_words = set(STREET_ABBREVIATIONS.keys()) | set(STREET_ABBREVIATIONS.values())
+    street_type_words = {w.rstrip('.') for w in street_type_words}
+
+    street_words = []
+    for token in tokens:
+        t = token.rstrip('.')
+        if t in street_type_words:
+            continue
+        if re.match(r'^\d+([а-яa-z]|к\d+|\/\d+)?$', t):
+            continue
+        street_words.append(t)
+
+    return ' '.join(street_words)
+
+def extract_house_number(tokens: list[str]) -> str | None:
+    for token in tokens:
+        if re.match(r'^\d+([а-яa-z]|к\d+|\/\d+)?$', token):
+            return token
+    return None
+
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+async def get_or_create_user(session: AsyncSession, telegram_id: int, username: str | None) -> User:
+    result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        user = User(telegram_id=telegram_id, username=username)
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+    return user
+
+async def save_nosology(session: AsyncSession, telegram_id: int, nosology: str) -> None:
+    result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+    user = result.scalar_one_or_none()
+    if user:
+        user.nosology = nosology
+        await session.commit()
+
+async def get_user_nosology(session: AsyncSession, telegram_id: int) -> str | None:
+    result = await session.execute(select(User.nosology).where(User.telegram_id == telegram_id))
+    return result.scalar_one_or_none()
+
+async def find_place(session: AsyncSession, name_query: str, address_query: str) -> dict | None:
+    norm_name    = normalize_name(name_query)
+    addr_tokens  = normalize_address(address_query)
+    street_name  = extract_street_name(addr_tokens)
+    house_number = extract_house_number(addr_tokens)
+
+    result = await session.execute(
+        select(Place, Accessibility, Chain)
+        .join(Accessibility, Place.id == Accessibility.place_id)
+        .outerjoin(Chain, Place.chain_id == Chain.id)
+    )
+    all_rows = result.all()
+
+    if not all_rows:
+        return None
+
+    candidates = []
+    for place, acc, chain in all_rows:
+        score = _score_match(
+            place=place,
+            chain=chain,
+            norm_name=norm_name,
+            name_query=name_query.lower(),
+            street_name=street_name,
+            house_number=house_number,
+            addr_tokens=addr_tokens,
+        )
+        if score > 0:
+            candidates.append((score, place, acc, chain))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, best_place, best_acc, best_chain = candidates[0]
+    return _place_to_dict(best_place, best_acc, best_chain)
+
+def _score_match(
+    place: Place,
+    chain: Chain | None,
+    norm_name: str,
+    name_query: str,
+    street_name: str,
+    house_number: str | None,
+    addr_tokens: list[str],
+) -> int:
+    score = 0
+    place_name_lower = place.name.lower()
+    place_addr_lower = place.address.lower()
+    chain_name_lower = chain.name.lower() if chain else ""
+
+    place_name_norm = normalize_yo(place_name_lower)
+    place_addr_norm = normalize_yo(place_addr_lower)
+    chain_name_norm = normalize_yo(chain_name_lower)
+    norm_name_norm  = normalize_yo(norm_name)
+    name_query_norm = normalize_yo(name_query)
+
+    if norm_name_norm and (norm_name_norm in place_name_norm or norm_name_norm in chain_name_norm):
+        score += 50
+    elif name_query_norm and (name_query_norm in place_name_norm or name_query_norm in chain_name_norm):
+        score += 40
+    else:
+        for word in norm_name_norm.split():
+            if len(word) >= 3 and word in place_name_norm:
+                score += 15
+            if len(word) >= 3 and word in chain_name_norm:
+                score += 10
+
+    if score == 0:
+        return 0
+
+    if street_name and len(street_name) >= 3:
+        street_norm = normalize_yo(street_name)
+        street_variants = [street_norm]
+        alt = street_norm
+        for word, replacement in ORDINAL_MAP.items():
+            if word in alt:
+                alt = alt.replace(word, replacement)
+        if alt != street_norm:
+            street_variants.append(normalize_yo(alt))
+
+        street_found = False
+        for variant in street_variants:
+            if variant in place_addr_norm:
+                street_found = True
+                break
+            if len(variant) >= 5 and variant[:5] in place_addr_norm:
+                street_found = True
+                break
+
+        if not street_found:
+            return 0
+
+        score += 40
+
+    if house_number:
+        def normalize_house(h: str) -> str:
+            h = normalize_yo(h.lower().strip())
+            h = re.sub(r'\s*(корпус|корп|к)\s*', 'к', h)
+            h = re.sub(r'\s*(строение|стр|с)\s*', 'с', h)
+            h = h.replace(' ', '')
+            return h
+
+        user_house   = normalize_house(house_number)
+        addr_for_house = normalize_house(place_addr_lower)
+
+        if user_house not in addr_for_house:
+            return 0
+
+        score += 30
+
+    return score
+
+async def find_nearest_same_chain(
+    session: AsyncSession,
+    chain_id: int,
+    nosology: str,
+    user_lat: float,
+    user_lon: float,
+    exclude_place_id: int,
+    limit: int = 3
+) -> list[dict]:
+    if not chain_id:
+        return []
+    result = await session.execute(
+        select(Place, Accessibility, Chain)
+        .join(Accessibility, Place.id == Accessibility.place_id)
+        .outerjoin(Chain, Place.chain_id == Chain.id)
+        .where(and_(
+            Place.chain_id == chain_id,
+            Place.id != exclude_place_id,
+            _nosology_filter(Accessibility, nosology)
+        ))
+    )
+    return _sort_by_distance(result.all(), user_lat, user_lon, limit)
+
+async def find_nearest_any(
+    session: AsyncSession,
+    category: str,
+    nosology: str,
+    user_lat: float,
+    user_lon: float,
+    exclude_place_id: int,
+    limit: int = 3
+) -> list[dict]:
+    result = await session.execute(
+        select(Place, Accessibility, Chain)
+        .join(Accessibility, Place.id == Accessibility.place_id)
+        .outerjoin(Chain, Place.chain_id == Chain.id)
+        .where(and_(
+            Place.category == category,
+            Place.id != exclude_place_id,
+            _nosology_filter(Accessibility, nosology)
+        ))
+    )
+    return _sort_by_distance(result.all(), user_lat, user_lon, limit)
+
+async def find_nearest_by_name(
+    session: AsyncSession,
+    name_query: str,
+    nosology: str | None,
+    user_lat: float,
+    user_lon: float,
+    limit: int = 3
+) -> list[dict]:
+    norm     = normalize_yo(normalize_name(name_query))
+    original = normalize_yo(name_query.lower())
+
+    result = await session.execute(
+        select(Place, Accessibility, Chain)
+        .join(Accessibility, Place.id == Accessibility.place_id)
+        .outerjoin(Chain, Place.chain_id == Chain.id)
+        .where(
+            or_(
+                func.replace(func.lower(Place.name), 'ё', 'е').contains(norm),
+                func.replace(func.lower(Place.name), 'ё', 'е').contains(original),
+                func.lower(Place.name).contains(name_query.lower()),
+            )
+        )
+    )
+    rows = result.all()
+    return _sort_by_distance(rows, user_lat, user_lon, limit)
+
+async def geocode_address(address: str) -> tuple[float | None, float | None]:
+    import httpx
+    query = address if "санкт-петербург" in address.lower() else f"{address}, Санкт-Петербург"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": query, "format": "json", "limit": 1, "countrycodes": "ru"},
+                headers={"User-Agent": "AccessibilityBot/1.0"},
+                timeout=10,
+            )
+            results = resp.json()
+            if results:
+                return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception:
+        pass
+    return None, None
+
+def is_adapted(place_dict: dict, nosology: str) -> bool:
+    return place_dict.get(nosology, False)
+
+def _nosology_filter(acc_model, nosology: str):
+    if nosology == "wheelchair":
+        return acc_model.wheelchair == True
+    elif nosology == "blind":
+        return acc_model.blind == True
+    elif nosology == "deaf":
+        return acc_model.deaf == True
+    return acc_model.wheelchair == True
+
+def _place_to_dict(place: Place, acc: Accessibility, chain: Chain | None) -> dict:
+    return {
+        "id":                 place.id,
+        "name":               place.name,
+        "address":            place.address,
+        "lat":                place.lat,
+        "lon":                place.lon,
+        "phone":              place.phone or "не указан",
+        "category":           place.category.value if place.category else "",
+        "chain_id":           place.chain_id,
+        "chain_name":         chain.name if chain else "независимое заведение",
+        "wheelchair":         acc.wheelchair,
+        "blind":              acc.blind,
+        "deaf":               acc.deaf,
+        "accessible_entrance":acc.accessible_entrance,
+        "accessible_toilet":  acc.accessible_toilet,
+        "elevator":           acc.elevator,
+        "braille_signs":      acc.braille_signs,
+        "audio_guide":        acc.audio_guide,
+        "induction_loop":     acc.induction_loop,
+        "visual_alerts":      acc.visual_alerts,
+        "notes":              acc.notes or "",
+    }
+
+def _sort_by_distance(rows, user_lat: float, user_lon: float, limit: int) -> list[dict]:
+    results = []
+    for place, acc, chain in rows:
+        dist = haversine(user_lat, user_lon, place.lat, place.lon)
+        d = _place_to_dict(place, acc, chain)
+        d["distance_km"] = dist
+        results.append(d)
+    results.sort(key=lambda x: x["distance_km"])
+    return results[:limit]
+
+def format_place_card(place: dict, nosology: str, adapted: bool) -> str:
+    nosology_labels = {
+        "wheelchair": "колясочников ♿",
+        "blind":      "слабовидящих 👁",
+        "deaf":       "слабослышащих 👂",
+    }
+    label  = nosology_labels.get(nosology, nosology)
+    status = "✅ Адаптировано" if adapted else "❌ Не адаптировано"
+
+    details = []
+    if nosology == "wheelchair":
+        if place.get("accessible_entrance"):
+            details.append("• Доступный вход (пандус/автодверь)")
+        if place.get("accessible_toilet"):
+            details.append("• Доступный туалет")
+        if place.get("elevator"):
+            details.append("• Лифт")
+    elif nosology == "blind":
+        if place.get("braille_signs"):
+            details.append("• Таблички Брайля")
+        if place.get("audio_guide"):
+            details.append("• Аудиогид / голосовые подсказки")
+    elif nosology == "deaf":
+        if place.get("induction_loop"):
+            details.append("• Индукционная петля")
+        if place.get("visual_alerts"):
+            details.append("• Световые оповещения")
+
+    text = (
+        f"🏢 <b>{place['name']}</b>\n"
+        f"📮 {place['address']}\n"
+        f"📞 {place['phone']}\n\n"
+        f"{status} для {label}\n"
+    )
+    if details:
+        text += "\n".join(details) + "\n"
+    if place.get("notes"):
+        text += f"\n💬 {place['notes']}\n"
+    return text
